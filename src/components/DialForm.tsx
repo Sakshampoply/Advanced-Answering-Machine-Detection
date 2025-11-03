@@ -5,6 +5,7 @@ import { useRouter } from "next/navigation";
 
 export default function DialForm() {
   const [phone, setPhone] = useState("");
+  const [strategy, setStrategy] = useState<string>("gemini-live");
   const [loading, setLoading] = useState(false);
   const [error, setError] = useState<string | null>(null);
   const [success, setSuccess] = useState<string | null>(null);
@@ -28,6 +29,7 @@ export default function DialForm() {
         headers: { "Content-Type": "application/json" },
         body: JSON.stringify({
           phone,
+          strategy,
           // userId will be added later when authentication is implemented
         }),
       });
@@ -81,13 +83,22 @@ export default function DialForm() {
           </label>
           <select
             id="strategy"
-            disabled
-            className="w-full px-4 py-2 border border-gray-300 rounded-lg bg-gray-100 text-gray-600 cursor-not-allowed"
+            value={strategy}
+            onChange={(e) => setStrategy(e.target.value)}
+            className="w-full px-4 py-2 border border-gray-300 rounded-lg bg-white"
+            disabled={loading}
           >
-            <option>Gemini Flash 2.5 Live API</option>
+            <option value="gemini-live">Gemini Flash 2.5 Live API</option>
+            <option value="twilio-amd">Twilio Native AMD (Baseline)</option>
+            <option value="jambonz" disabled>
+              Jambonz SIP (Coming Soon)
+            </option>
+            <option value="hf-ml" disabled>
+              Hugging Face Model (Coming Soon)
+            </option>
           </select>
           <p className="text-xs text-gray-500 mt-1">
-            Currently using Gemini Flash only
+            Choose baseline (Twilio) or Gemini Live.
           </p>
         </div>
 

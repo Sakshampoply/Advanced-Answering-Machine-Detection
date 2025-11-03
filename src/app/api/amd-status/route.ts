@@ -10,22 +10,32 @@ export async function POST(req: NextRequest) {
     const machineDetectionStatus = formData.get(
       "AnsweringMachineDetectionStatus"
     ) as string | null;
+    // Some Twilio accounts/regions send AnsweredBy instead of AnsweringMachineDetectionStatus
+    const answeredBy = (formData.get("AnsweredBy") as string | null) || null;
     const callStatus = formData.get("CallStatus") as string | null;
 
     console.log(
-      `AMD Status - Call: ${callSid}, MachineDetectionStatus: ${machineDetectionStatus}, CallStatus: ${callStatus}`
+      `AMD Status - Call: ${callSid}, MachineDetectionStatus: ${machineDetectionStatus}, AnsweredBy: ${answeredBy}, CallStatus: ${callStatus}`
     );
+    console.log(`[AMD Status] Keys: ${Array.from(formData.keys()).join(", ")}`);
+
+    // If neither AMD field is present, ignore gracefully
+    if (!machineDetectionStatus && !answeredBy) {
+      console.log("[AMD Status] No AMD fields present; ignoring non-AMD callback.");
+      return NextResponse.json({ message: "Ignored non-AMD callback" }, { status: 200 });
+    }
 
     // Map Twilio AMD status to our status
     let status = "Unknown";
     let result = null;
 
-    if (machineDetectionStatus === "human_detected") {
+    if (machineDetectionStatus === "human_detected" || answeredBy === "human") {
       status = "Human Detected";
       result = "human";
     } else if (
       machineDetectionStatus === "machine_detected" ||
-      machineDetectionStatus === "machine_start"
+      machineDetectionStatus === "machine_start" ||
+      answeredBy?.startsWith("machine")
     ) {
       status = "Machine Detected";
       result = "machine";

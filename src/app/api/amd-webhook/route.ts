@@ -6,6 +6,8 @@ export async function POST(req: NextRequest) {
     console.log(`[AMD Webhook] Request received`);
     console.log(`[AMD Webhook] Method: ${req.method}`);
     console.log(`[AMD Webhook] URL: ${req.url}`);
+    const url = new URL(req.url);
+    const strategy = url.searchParams.get("strategy") || "gemini-live";
     
     const formData = await req.formData();
     const callSid = formData.get("CallSid") as string | null;
@@ -13,44 +15,39 @@ export async function POST(req: NextRequest) {
     console.log(`[AMD Webhook] Call SID: ${callSid}`);
     console.log(`[AMD Webhook] Form data keys: ${Array.from(formData.keys()).join(", ")}`);
 
-    // Create TwiML response with Media Streams enabled
+    // Create TwiML response (branch by strategy)
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
 
-    // Start Media Streams to capture audio in real-time
-    // The Media Stream Server (port 3001) is exposed via ngrok for Twilio to reach it
-    const mediaStreamPublicUrl = process.env.MEDIA_STREAM_PUBLIC_URL || process.env.NEXT_PUBLIC_API_URL;
-    if (!mediaStreamPublicUrl) {
-      console.error("MEDIA_STREAM_PUBLIC_URL or NEXT_PUBLIC_API_URL not set in .env");
-      throw new Error("Missing Media Stream URL configuration");
+    if (strategy === "twilio-amd") {
+      // Baseline: rely on Twilio's native AMD; keep TwiML simple
+      twiml.say({ voice: "alice" }, "Hello. Please hold.");
+      twiml.pause({ length: 10 });
+      // Twilio AMD runs before/alongside TwiML; results are posted to statusCallback
+    } else {
+      // Default: Gemini Live strategy uses Media Streams
+      const mediaStreamPublicUrl = process.env.MEDIA_STREAM_PUBLIC_URL || process.env.NEXT_PUBLIC_API_URL;
+      if (!mediaStreamPublicUrl) {
+        console.error("MEDIA_STREAM_PUBLIC_URL or NEXT_PUBLIC_API_URL not set in .env");
+        throw new Error("Missing Media Stream URL configuration");
+      }
+
+      // Convert to WebSocket URL - put callSid in path, not query string
+      const mediaStreamUrl = `${mediaStreamPublicUrl.replace(/\/$/, "")}/media-stream/${callSid}`
+        .replace(/^https/, "wss").replace(/^http/, "ws");
+
+      console.log(`Media Stream URL for Twilio: ${mediaStreamUrl}`);
+
+      const startVerb = twiml.start();
+      startVerb.stream({ url: mediaStreamUrl });
+
+      twiml.say({ voice: "alice" }, "Thank you for calling. One moment please.");
+      twiml.gather({ numDigits: 1, timeout: 30 });
     }
-    
-    // Convert to WebSocket URL - put callSid in path, not query string
-    // (Twilio strips query strings on WebSocket upgrade)
-    const mediaStreamUrl = `${mediaStreamPublicUrl.replace(/\/$/, "")}/media-stream/${callSid}`.replace(/^https/, "wss").replace(/^http/, "ws");
-    
-    console.log(`Media Stream URL for Twilio: ${mediaStreamUrl}`);
-    
-    // Use the Stream element through TwiML
-    const startVerb = twiml.start();
-    startVerb.stream({
-      url: mediaStreamUrl,
-    });
-
-    // Say initial greeting while analyzing
-    twiml.say({
-      voice: "alice",
-    }, "Thank you for calling. One moment please.");
-
-    // Keep the call alive while analyzing
-    twiml.gather({
-      numDigits: 1,
-      timeout: 30,
-    });
 
     const twimlString = twiml.toString();
-    console.log(`TwiML Response:\n${twimlString}`);
-    console.log(`Started Media Stream for call ${callSid}`);
+  console.log(`TwiML Response:\n${twimlString}`);
+  console.log(`Responded with strategy: ${strategy} for call ${callSid}`);
 
     return new NextResponse(twiml.toString(), {
       headers: { "Content-Type": "application/xml" },
