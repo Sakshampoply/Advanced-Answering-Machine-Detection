@@ -1,0 +1,33 @@
+// This is your Prisma schema file,
+// learn more about it in the docs: https://pris.ly/d/prisma-schema
+
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+model User {
+  id    Int     @id @default(autoincrement())
+  email String  @unique
+  name  String?
+  calls CallLog[]
+}
+
+model CallLog {
+  id        Int      @id @default(autoincrement())
+  userId    Int?
+  user      User?    @relation(fields: [userId], references: [id])
+  callSid   String?  @unique
+  phone     String
+  strategy  String   @default("Gemini Flash")
+  status    String   // "Initiated", "Ringing", "Human Detected", "Machine Detected", "Failed"
+  result    String?  // "human", "machine", "no_answer", "timeout"
+  confidence Float?
+  duration  Int?     // in seconds
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+}
