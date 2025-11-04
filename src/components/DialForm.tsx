@@ -93,9 +93,7 @@ export default function DialForm() {
             <option value="jambonz" disabled>
               Jambonz SIP (Coming Soon)
             </option>
-            <option value="hf-ml" disabled>
-              Hugging Face Model (Coming Soon)
-            </option>
+            <option value="hf-ml">Hugging Face Model</option>
           </select>
           <p className="text-xs text-gray-500 mt-1">
             Choose baseline (Twilio) or Gemini Live.

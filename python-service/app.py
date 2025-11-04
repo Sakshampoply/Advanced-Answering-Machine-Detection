@@ -22,9 +22,17 @@ import io
 from pathlib import Path
 from typing import Optional
 from dotenv import load_dotenv
+import tempfile
 
 from google import genai
 from google.genai import types
+import httpx
+from typing import Optional as _Optional
+
+try:
+    from faster_whisper import WhisperModel  # type: ignore
+except Exception:
+    WhisperModel = None  # runtime optional
 import websockets
 
 # Load .env from parent directory
@@ -47,6 +55,23 @@ client = genai.Client(api_key=GEMINI_API_KEY)
 # Configuration
 GEMINI_MODEL = "gemini-live-2.5-flash-preview"
 DECISION_THRESHOLD_CONFIDENCE = 0.75
+
+# Hugging Face Inference API config
+HF_API_TOKEN = os.getenv("HUGGINGFACE_API_TOKEN")
+HF_ASR_MODEL = os.getenv("HF_ASR_MODEL", "distil-whisper/distil-small.en")
+LOCAL_WHISPER_MODEL = os.getenv("LOCAL_WHISPER_MODEL", "tiny.en")
+USE_LOCAL_WHISPER_FALLBACK = os.getenv(
+    "USE_LOCAL_WHISPER_FALLBACK", "true"
+).lower() in ("1", "true", "yes")
+PRELOAD_LOCAL_WHISPER = os.getenv("PRELOAD_LOCAL_WHISPER", "false").lower() in (
+    "1",
+    "true",
+    "yes",
+)
+_whisper_model = None  # lazy-loaded local whisper model
+
+# Global flag to skip remote HF calls after repeated 410s
+HF_REMOTE_DISABLED = False
 
 # AMD System Prompt
 AMD_SYSTEM_PROMPT = """You are an advanced Answering Machine Detection (AMD) system.
@@ -380,6 +405,35 @@ def pcmu_to_pcm16(pcmu_data: bytes) -> bytes:
     return bytes(pcm_data)
 
 
+def pcm16_to_wav(pcm16_data: bytes, sample_rate: int = 8000) -> bytes:
+    """Wrap raw PCM16 mono data into a standard PCM WAV container."""
+    num_channels = 1
+    bits_per_sample = 16
+    byte_rate = sample_rate * num_channels * bits_per_sample // 8
+    block_align = num_channels * bits_per_sample // 8
+    data_size = len(pcm16_data)
+
+    buf = io.BytesIO()
+    # RIFF header
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    # fmt chunk
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<I", 16))  # Subchunk1Size
+    buf.write(struct.pack("<H", 1))  # PCM format
+    buf.write(struct.pack("<H", num_channels))
+    buf.write(struct.pack("<I", sample_rate))
+    buf.write(struct.pack("<I", byte_rate))
+    buf.write(struct.pack("<H", block_align))
+    buf.write(struct.pack("<H", bits_per_sample))
+    # data chunk
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    buf.write(pcm16_data)
+    return buf.getvalue()
+
+
 class CallSession:
     """Track state for each call."""
 
@@ -389,12 +443,30 @@ class CallSession:
         self.confidence = 0.0
         self.audio_chunks = 0
         self.total_ms = 0
+        self.buffer_pcm16 = bytearray()
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     """Lifespan events."""
     logger.info("AMD service starting...")
+    # Optional: preload local whisper to reduce first-call latency
+    global _whisper_model
+    if (
+        PRELOAD_LOCAL_WHISPER
+        and USE_LOCAL_WHISPER_FALLBACK
+        and WhisperModel is not None
+    ):
+        try:
+            if _whisper_model is None:
+                logger.info(
+                    f"[HF] Preloading local Whisper model: {LOCAL_WHISPER_MODEL}"
+                )
+                _whisper_model = WhisperModel(
+                    LOCAL_WHISPER_MODEL, device="cpu", compute_type="int8"
+                )
+        except Exception as e:
+            logger.warning(f"[HF] Failed to preload local Whisper: {e}")
     yield
     logger.info("Shutting down...")
     active_calls.clear()
@@ -738,3 +810,336 @@ async def websocket_amd(websocket: WebSocket, call_sid: str):
         if call_sid in active_calls:
             del active_calls[call_sid]
         logger.info(f"Session cleaned up: {call_sid}")
+
+
+async def hf_transcribe(wav_bytes: bytes) -> str:
+    """Call Hugging Face Inference API (ASR) and return transcript text with fallbacks."""
+    if not HF_API_TOKEN:
+        logger.warning("HUGGINGFACE_API_TOKEN not set; returning empty transcript")
+        return ""
+    # If we've previously observed HF returning 410, skip remote and trigger local fallback
+    global HF_REMOTE_DISABLED
+    if HF_REMOTE_DISABLED:
+        raise RuntimeError("HF remote disabled due to previous 410 responses")
+
+    models_to_try = [
+        HF_ASR_MODEL,
+        "openai/whisper-tiny",
+        "openai/whisper-base.en",
+        "distil-whisper/distil-medium.en",
+    ]
+
+    headers = {"Authorization": f"Bearer {HF_API_TOKEN}", "Content-Type": "audio/wav"}
+    timeout = httpx.Timeout(25.0, connect=10.0)
+    async with httpx.AsyncClient(timeout=timeout) as client:
+        last_error = None
+        for model_id in models_to_try:
+            url = f"https://api-inference.huggingface.co/models/{model_id}"
+            try:
+                r = await client.post(url, content=wav_bytes, headers=headers)
+                r.raise_for_status()
+                data = r.json()
+                if isinstance(data, dict) and "text" in data:
+                    return data["text"] or ""
+                if (
+                    isinstance(data, list)
+                    and data
+                    and isinstance(data[0], dict)
+                    and "text" in data[0]
+                ):
+                    return data[0]["text"] or ""
+                last_error = ValueError(
+                    f"Unexpected ASR response format from {model_id}"
+                )
+            except httpx.HTTPStatusError as e:
+                last_error = e
+                code = e.response.status_code
+                logger.warning(f"[HF] Transcription error from {model_id}: {code}")
+                if code == 410:
+                    # Model deprecated or unavailable: disable further remote attempts
+                    HF_REMOTE_DISABLED = True
+                if code in (401, 403):
+                    break
+            except Exception as e:
+                last_error = e
+                logger.warning(f"[HF] Transcription exception from {model_id}: {e}")
+        if last_error:
+            raise last_error
+        return ""
+
+
+def local_transcribe_wav(wav_bytes: bytes) -> str:
+    """Transcribe using local faster-whisper as a fallback. Returns transcript or empty string.
+
+    Requires faster-whisper installed and ffmpeg available on PATH.
+    """
+    global _whisper_model
+    if not USE_LOCAL_WHISPER_FALLBACK:
+        return ""
+    if WhisperModel is None:
+        logger.warning("[HF] Local fallback requested but faster-whisper not installed")
+        return ""
+    try:
+        if _whisper_model is None:
+            logger.info(f"[HF] Loading local Whisper model: {LOCAL_WHISPER_MODEL}")
+            _whisper_model = WhisperModel(
+                LOCAL_WHISPER_MODEL, device="cpu", compute_type="int8"
+            )
+        # Write wav to temp file for robust decoding
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=True) as tmp:
+            tmp.write(wav_bytes)
+            tmp.flush()
+            segments, _ = _whisper_model.transcribe(
+                tmp.name, vad_filter=True, beam_size=1
+            )
+            text_parts = []
+            for seg in segments:
+                if getattr(seg, "text", None):
+                    text_parts.append(seg.text)
+            return " ".join(text_parts).strip()
+    except Exception as e:
+        logger.warning(f"[HF] Local whisper fallback failed: {e}")
+        return ""
+
+
+def classify_transcript(text: str) -> tuple[str, float, str]:
+    """Simple heuristics for AMD based on transcript."""
+    t = (text or "").strip().lower()
+    if not t:
+        return ("uncertain", 0.5, "no transcript yet")
+
+    vm_patterns = [
+        "leave a message",
+        "leave your message",
+        "after the tone",
+        "at the tone",
+        "record your message",
+        "not available",
+        "voicemail",
+        "mailbox",
+        "beep",
+    ]
+    if any(p in t for p in vm_patterns):
+        return ("machine", 0.95, "voicemail phrase detected")
+
+    words = t.split()
+    if len(words) >= 8:
+        return ("machine", 0.8, "long monologue early")
+
+    if t.startswith("hello") or t.startswith("hi") or t.startswith("hey"):
+        if len(words) <= 5:
+            return ("human", 0.8, "short greeting")
+
+    return ("uncertain", 0.55, "insufficient evidence")
+
+
+@app.websocket("/ws/hf/{call_sid}")
+async def websocket_hf(websocket: WebSocket, call_sid: str):
+    """Real-time AMD via Hugging Face ASR + heuristics.
+
+    Strategy: accumulate PCM16 audio; every ~1s send short WAV to ASR, classify.
+    Stop once a confident decision is made or on end/close.
+    """
+    await websocket.accept()
+    session = CallSession(call_sid)
+    active_calls[call_sid] = session
+
+    logger.info(f"[HF] WebSocket opened for call: {call_sid}")
+    decision_sent = False
+    last_checked_len = 0
+
+    # Proactively warm up local whisper in background to reduce latency
+    warmup_task: asyncio.Task | None = None
+    if USE_LOCAL_WHISPER_FALLBACK and WhisperModel is not None:
+
+        async def _warmup():
+            try:
+                global _whisper_model
+                if _whisper_model is None:
+                    logger.info(
+                        f"[HF] Warming up local Whisper model: {LOCAL_WHISPER_MODEL}"
+                    )
+                    _whisper_model = WhisperModel(
+                        LOCAL_WHISPER_MODEL, device="cpu", compute_type="int8"
+                    )
+            except Exception as e:
+                logger.warning(f"[HF] Warmup failed: {e}")
+
+        warmup_task = asyncio.create_task(_warmup())
+
+    async def analyze_loop():
+        nonlocal decision_sent, last_checked_len
+        try:
+            while not decision_sent:
+                await asyncio.sleep(1.0)
+                if (
+                    len(session.buffer_pcm16) - last_checked_len < 16000
+                ):  # ~1s at 8kHz*2bytes
+                    continue
+                last_checked_len = len(session.buffer_pcm16)
+
+                # Use up to first 6s for early decision
+                max_bytes = 6 * 8000 * 2
+                chunk = bytes(session.buffer_pcm16[:max_bytes])
+                wav = pcm16_to_wav(chunk, 8000)
+                try:
+                    text = await hf_transcribe(wav)
+                    logger.info(f"[HF] Transcript ({call_sid}): {text}")
+                    # If remote returns empty, immediately try local fallback
+                    if not text:
+                        raise RuntimeError("empty transcript from remote")
+                    decision, conf, reason = classify_transcript(text)
+                    if decision != "uncertain" and conf >= 0.75:
+                        try:
+                            await websocket.send_json(
+                                {
+                                    "type": "analysis_complete",
+                                    "result": decision,
+                                    "confidence": conf,
+                                    "reason": reason,
+                                }
+                            )
+                        except Exception:
+                            pass
+                        decision_sent = True
+                        break
+                except Exception as e:
+                    logger.warning(f"[HF] Transcription error: {e}")
+                    # Local fallback
+                    try:
+                        text = await asyncio.to_thread(local_transcribe_wav, wav)
+                        if text:
+                            decision, conf, reason = classify_transcript(text)
+                            if decision != "uncertain" and conf >= 0.75:
+                                try:
+                                    await websocket.send_json(
+                                        {
+                                            "type": "analysis_complete",
+                                            "result": decision,
+                                            "confidence": conf,
+                                            "reason": reason,
+                                        }
+                                    )
+                                except Exception:
+                                    pass
+                                decision_sent = True
+                                break
+                    except Exception as e2:
+                        logger.warning(f"[HF] Local fallback error: {e2}")
+
+        except asyncio.CancelledError:
+            pass
+
+    analyze_task = asyncio.create_task(analyze_loop())
+
+    try:
+        while not decision_sent:
+            data = await websocket.receive_text()
+            try:
+                message = json.loads(data)
+            except json.JSONDecodeError:
+                continue
+            msg_type = message.get("type")
+            if msg_type == "audio":
+                audio_b64 = message.get("data")
+                if audio_b64:
+                    audio_chunk = base64.b64decode(audio_b64)
+                    pcm16 = pcmu_to_pcm16(audio_chunk)
+                    session.buffer_pcm16.extend(pcm16)
+            elif msg_type == "end" or msg_type == "call_ended":
+                break
+
+        # Final attempt if no decision yet
+        if not decision_sent and session.buffer_pcm16:
+            wav = pcm16_to_wav(bytes(session.buffer_pcm16), 8000)
+            try:
+                text = await hf_transcribe(wav)
+                if not text:
+                    raise RuntimeError("empty transcript from remote")
+                decision, conf, reason = classify_transcript(text)
+                # Even if confidence is low, emit a final decision so downstream can close gracefully
+                final_decision = (
+                    decision
+                    if conf >= 0.75
+                    else (decision if decision != "uncertain" else "uncertain")
+                )
+                final_conf = (
+                    conf
+                    if conf >= 0.75
+                    else (conf if decision != "uncertain" else 0.55)
+                )
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "analysis_complete",
+                            "result": final_decision,
+                            "confidence": final_conf,
+                            "reason": reason,
+                        }
+                    )
+                except Exception:
+                    pass
+                decision_sent = True
+            except Exception as e:
+                logger.error(f"[HF] Final transcription error: {e}")
+                # Try local fallback once more
+                try:
+                    text = await asyncio.to_thread(local_transcribe_wav, wav)
+                    if text is not None:
+                        decision, conf, reason = classify_transcript(text)
+                        # Emit whatever best-effort decision we have
+                        final_decision = (
+                            decision
+                            if conf >= 0.75
+                            else (decision if decision != "uncertain" else "uncertain")
+                        )
+                        final_conf = (
+                            conf
+                            if conf >= 0.75
+                            else (conf if decision != "uncertain" else 0.55)
+                        )
+                        try:
+                            await websocket.send_json(
+                                {
+                                    "type": "analysis_complete",
+                                    "result": final_decision,
+                                    "confidence": final_conf,
+                                    "reason": reason,
+                                }
+                            )
+                        except Exception:
+                            pass
+                        decision_sent = True
+                        return
+                except Exception as e2:
+                    logger.warning(f"[HF] Final local fallback error: {e2}")
+                try:
+                    await websocket.send_json(
+                        {
+                            "type": "analysis_complete",
+                            "result": "uncertain",
+                            "confidence": 0.5,
+                            "reason": "hf error",
+                        }
+                    )
+                except Exception:
+                    pass
+                decision_sent = True
+
+    except WebSocketDisconnect:
+        logger.info(f"[HF] WebSocket disconnected: {call_sid}")
+    except Exception as e:
+        logger.error(f"[HF] WebSocket error: {e}", exc_info=True)
+    finally:
+        if not analyze_task.done():
+            analyze_task.cancel()
+        if warmup_task and not warmup_task.done():
+            warmup_task.cancel()
+        active_calls.pop(call_sid, None)
+        logger.info(f"[HF] Session cleaned up: {call_sid}")
+
+
+# Back-compat alias: some callers may still hit /ws/amd/hf/{call_sid}
+@app.websocket("/ws/amd/hf/{call_sid}")
+async def websocket_hf_alias(websocket: WebSocket, call_sid: str):
+    await websocket_hf(websocket, call_sid)

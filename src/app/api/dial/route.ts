@@ -73,7 +73,7 @@ export async function POST(req: NextRequest) {
     // Log the call initiation in the database
     const callLogData: any = {
       phone,
-      strategy: strategy === "twilio-amd" ? "Twilio AMD" : "Gemini Live",
+      strategy: strategy === "twilio-amd" ? "Twilio AMD" : strategy === "hf-ml" ? "Hugging Face" : "Gemini Live",
       status: "Initiated",
       callSid: call.sid,
     };

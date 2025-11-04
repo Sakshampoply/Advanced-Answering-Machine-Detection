@@ -13,8 +13,16 @@ const activeStreams = new Map<string, any>();
 // Create WebSocket server for Twilio Media Streams
 const wss = new WebSocketServer({ noServer: true });
 
-wss.on("connection", async (ws: any, req: IncomingMessage, callSid: string) => {
-  console.log(`[Media Stream] New connection for call: ${callSid}`);
+wss.on("connection", async (ws: any, req: IncomingMessage, callSid: string, strategy: "gemini" | "hf" = "gemini") => {
+  // Back-compat guard: older upgrade logic may pass callSid as "hf/{sid}" or "gemini/{sid}"
+  if (callSid.includes("/")) {
+    const [maybeStrat, sid] = callSid.split("/");
+    if ((maybeStrat === "hf" || maybeStrat === "gemini") && sid) {
+      strategy = maybeStrat as any;
+      callSid = sid;
+    }
+  }
+  console.log(`[Media Stream] New connection for call: ${callSid} (strategy=${strategy})`);
 
   let pythonWs: any = null;
   let buffer = Buffer.alloc(0);
@@ -25,8 +33,9 @@ wss.on("connection", async (ws: any, req: IncomingMessage, callSid: string) => {
 
   try {
     // Connect to Python service WebSocket
-    const pythonServiceUrl = process.env.PYTHON_SERVICE_URL || "http://localhost:8000";
-    const pythonWsUrl = pythonServiceUrl.replace(/^http/, "ws") + `/ws/amd/${callSid}`;
+  const pythonServiceUrl = process.env.PYTHON_SERVICE_URL || "http://localhost:8000";
+  const pathSeg = strategy === "hf" ? `/ws/hf/${callSid}` : `/ws/amd/${callSid}`;
+  const pythonWsUrl = pythonServiceUrl.replace(/^http/, "ws") + pathSeg;
 
     console.log(`[Media Stream] Connecting to Python service at: ${pythonWsUrl}`);
 
@@ -48,11 +57,13 @@ wss.on("connection", async (ws: any, req: IncomingMessage, callSid: string) => {
         
         // Send decision back to Twilio via the main WebSocket
         // Twilio will use this to decide TwiML action
+        // Human-readable percentage in reason (Twilio ignores it functionally but helpful for logs)
+        const pct = typeof message.confidence === 'number' ? (message.confidence * 100).toFixed(0) : '—';
         ws.send(
           JSON.stringify({
             type: "control_frame",
             action: "stop",
-            reason: `AMD ${message.result}: ${message.confidence}%`,
+            reason: `AMD ${message.result}: ${pct}%`,
           })
         );
 
@@ -72,7 +83,7 @@ wss.on("connection", async (ws: any, req: IncomingMessage, callSid: string) => {
     console.error(`[Media Stream] Failed to connect to Python service:`, error);
   }
 
-  ws.on("message", (data: Buffer) => {
+  ws.on("message", async (data: Buffer) => {
     try {
       const message = JSON.parse(data.toString());
 
@@ -110,12 +121,25 @@ wss.on("connection", async (ws: any, req: IncomingMessage, callSid: string) => {
           updateCallDuration(callSid, durationSeconds);
         }
         
+        // Politely signal end to analyzer and wait briefly for a final decision
+        const waitForDecision = async () => {
+          try {
+            if (pythonWs && pythonWs.readyState === 1) {
+              pythonWs.send(JSON.stringify({ type: "end" }));
+            }
+            const started = Date.now();
+            // Allow more time for HF strategy to finish local/remote ASR
+            const maxWaitMs = strategy === 'hf' ? 12000 : 2500;
+            while (!detectionResult && Date.now() - started < maxWaitMs) {
+              await new Promise((r) => setTimeout(r, 50));
+            }
+          } catch {}
+        };
+        await waitForDecision();
+
         // Clean up
-        if (pythonWs) {
-          pythonWs.send(JSON.stringify({ type: "end" }));
-          pythonWs.close();
-        }
-        ws.close();
+        try { if (pythonWs) pythonWs.close(); } catch {}
+        try { ws.close(); } catch {}
         activeStreams.delete(callSid);
       }
     } catch (error) {
@@ -203,10 +227,23 @@ server.on('upgrade', (request: IncomingMessage, socket: Socket, head: Buffer) =>
   const pathname = request.url;
 
   if (pathname && pathname.startsWith('/media-stream/')) {
+    // Support both /media-stream/{callSid} (backward compat) and /media-stream/{strategy}/{callSid}
+    const parts = pathname.split('/').filter(Boolean); // ["media-stream", maybeStrategy, callSid]
+    let strategy: "gemini" | "hf" = "gemini";
+    let callSid = "";
+
+    if (parts.length === 2) {
+      // /media-stream/{callSid}
+      callSid = parts[1];
+    } else if (parts.length >= 3) {
+      // /media-stream/{strategy}/{callSid}
+      strategy = parts[1] === 'hf' ? 'hf' : 'gemini';
+      callSid = parts[2];
+    }
+
     wss.handleUpgrade(request, socket, head, (ws) => {
-      const callSid = pathname.substring('/media-stream/'.length);
-      console.log(`[UPGRADE] Success for call: ${callSid}`);
-      wss.emit('connection', ws, request, callSid);
+      console.log(`[UPGRADE] Success for call: ${callSid}, strategy=${strategy}`);
+      wss.emit('connection', ws, request, callSid, strategy);
     });
   } else {
     console.log(`[UPGRADE] Invalid path. Destroying socket.`);

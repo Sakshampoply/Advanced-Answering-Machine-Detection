@@ -19,21 +19,22 @@ export async function POST(req: NextRequest) {
     const VoiceResponse = twilio.twiml.VoiceResponse;
     const twiml = new VoiceResponse();
 
-    if (strategy === "twilio-amd") {
+  if (strategy === "twilio-amd") {
       // Baseline: rely on Twilio's native AMD; keep TwiML simple
       twiml.say({ voice: "alice" }, "Hello. Please hold.");
       twiml.pause({ length: 10 });
       // Twilio AMD runs before/alongside TwiML; results are posted to statusCallback
     } else {
-      // Default: Gemini Live strategy uses Media Streams
+      // Default: Media Streams for model-driven strategies (Gemini Live, Hugging Face)
       const mediaStreamPublicUrl = process.env.MEDIA_STREAM_PUBLIC_URL || process.env.NEXT_PUBLIC_API_URL;
       if (!mediaStreamPublicUrl) {
         console.error("MEDIA_STREAM_PUBLIC_URL or NEXT_PUBLIC_API_URL not set in .env");
         throw new Error("Missing Media Stream URL configuration");
       }
 
-      // Convert to WebSocket URL - put callSid in path, not query string
-      const mediaStreamUrl = `${mediaStreamPublicUrl.replace(/\/$/, "")}/media-stream/${callSid}`
+      // Convert to WebSocket URL - include strategy segment: /media-stream/{strategy}/{callSid}
+      const strategySegment = strategy === "hf-ml" ? "hf" : "gemini";
+      const mediaStreamUrl = `${mediaStreamPublicUrl.replace(/\/$/, "")}/media-stream/${strategySegment}/${callSid}`
         .replace(/^https/, "wss").replace(/^http/, "ws");
 
       console.log(`Media Stream URL for Twilio: ${mediaStreamUrl}`);
